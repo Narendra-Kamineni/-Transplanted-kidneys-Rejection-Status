@@ -1,0 +1,866 @@
+---
+title: "Project Analysis of High Dimensional Data"
+author: "Bhanu Durganath Angam, Birgit Deboutte, Narendra Kamineni"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+      code_download: true
+      theme: flatly
+      toc: true
+      toc_float: true
+      highlight: tango
+    
+---
+
+```{r,echo=FALSE}
+suppressPackageStartupMessages({
+  library(readr)
+  library(dplyr)
+  library(ggplot2)
+  library(PMA)
+  library(MASS)
+  library(gridExtra)
+  library(sparseLDA)
+  library(locfdr)
+  library(glmnet)
+  library(plotROC)
+  library(boot)
+  library(pROC)
+  library(ROCR)
+})
+```
+
+# Summary
+
+In order to find a possible relation between the rejection status of transplanted kidneys and gene expression we looked at a data set of 13699 genes for 250 patients. On visualizing the data we can see that there is on average a difference in gene expression between genes from a patient with rejected kidneys compared to no rejection. In order to explore this further, t-tests were performed for all 13699 genes to see if they were differentially expressed. Running so many tests simultaneously will cause a multiple testing problem, and will return many false positives. We set the false discovery rate at 10%, meaning that we accepted on average a 10% chance of the tests coming up with a false positive. After correcting for the multiple testing problem, we found 3106 genes to show differential expression. We filtered these results additionally using a local false discovery rate in order to find the most promising genes. We then had 522 genes with a very low probability of being false positives. Next, we tried to find a prediction model that could predict the rejection status from gene expression. The original data set was subset in a training set and a test set. We tried out three different prediction model building methods, using the training data set, obtained the optimal model for each of these methods and evaluated these models with the test data set in terms of sensitivity and specificity. The Lasso model gave the best results, giving us a prediction model with a sensitivity of 0.77 and a specificity of 0.81. 
+
+
+# Data set
+
+The purpose of this project is to find a possible relation between the rejection status of transplanted kidneys and gene expression. We will work with a subset of 13669 genes for 25O patients, 174 of these patients did not reject their transplanted kidneys, 76 did reject them. The 13669 genes are the 25% most variable genes of a complete set of 54675 genes.
+
+```{r download-data, include=FALSE}
+# Create raw-data/ folder if it does not exist (you can change this to whatever path you want)
+out_path <- "raw-data"
+if (!(dir.exists(out_path))) dir.create(out_path)
+
+# Download data (only if doesn't exist locally)
+# Delete existing file with `unlink(file.path(out_path, fname))`
+# to force re-downloading
+fname <- "GSE21374-kidney-data.csv.gz"
+if (!file.exists(file.path(out_path, fname))) {
+  data_url <-
+    "https://github.com/statOmics/HDA2020/raw/data/GSE21374-kidney-data.csv.gz"
+  download.file(data_url, destfile = file.path(out_path, fname))
+}
+```
+
+```{r load-data, include=FALSE}
+## Assumes data is stored in "raw-data/" folder under current working directory
+data_dir <- "raw-data"
+kidney_data <- read_csv(
+  file.path(data_dir, "GSE21374-kidney-data.csv.gz"),
+  col_types = cols(
+    .default = col_double(),
+    Patient_ID = col_character()
+  )
+)
+
+## Glimpse first 10 columns
+str(kidney_data[, 1:10])
+
+## Extract gene expression data as matrix X
+X <- kidney_data %>% 
+  dplyr::select(-Patient_ID, -Reject_Status) %>% 
+  as.matrix()
+rownames(X) <- kidney_data$Patient_ID
+dim(X)
+str(X)
+X <- scale(X, center = TRUE, scale = TRUE) 
+
+## Extract Reject_Status column as vector
+reject_status <- as.factor(kidney_data$Reject_Status)
+names(reject_status) <- kidney_data$Patient_ID
+length(reject_status)
+table(reject_status) # number of 0's (accepts) and 1's (rejects)
+```
+
+# Data visualisation
+
+We will first try to visualize the data in order to see if certain patterns can be discovered. 
+
+## Scree plot
+
+We perform an SVD on X:
+
+$$
+X = \sum_{k=1}^r\delta_ku_kv_k^T
+$$
+with $r$ the rank of X, $\delta$ the singular values, $u$ the left singular vectors and $v$ the right singular vectors.
+
+We proceed to plot the singular values (principal components or PC's) against the proportion of the total variance that they account for.
+
+```{r warning=FALSE, cache =TRUE}
+svdX <- svd(X)
+```
+
+
+```{r warning=FALSE}
+nX <- nrow(X)
+r <- ncol(svdX$v)
+
+totVar <- sum(svdX$d^2)/(nX-1)
+vars <- data.frame(comp=1:r,var=svdX$d^2/(nX-1)) %>%
+  mutate(propVar=var/totVar,cumVar=cumsum(var/totVar))
+
+pVar2 <- vars %>%
+  ggplot(aes(x=comp:r,y=propVar)) +
+  geom_point() +
+  geom_line() +
+  xlab("PC") +
+  ylab("Proportion of Total Variance")
+
+pVar3 <- vars %>%
+  ggplot(aes(x=comp:r,y=cumVar)) +
+  geom_point() +
+  geom_line() +
+  xlab("PC") +
+  ylab("Cumulative Proportion of Total Variance")
+
+grid.arrange(pVar2, pVar3, nrow=1)
+```
+
+As we can see, even the first PC's don't explain much of the variability, which means we need many PC's to explain most of the variability. 
+
+Nevertheless, the first 2 principal components are used in order to facilitate visualisation of the data.
+
+
+## Scatterplot 
+
+
+```{r}
+k <- 2
+Vk <- svdX$v[,1:k]
+Uk <- svdX$u[,1:k]
+Dk <- diag(svdX$d[1:k])
+Zk <- Uk%*%Dk
+colnames(Zk) <- paste0("Z",1:k)
+
+
+Zk %>%
+  as.data.frame %>%
+  mutate(Reject_Status = reject_status %>% as.factor) %>%
+  ggplot(aes(x= Z1, y = Z2, color = Reject_Status)) +
+  geom_point(size = 3)
+```
+
+On the scatterplot each dot represents a patient and the colour is the rejection status of that patient, they are plotted against the first PC (x-axis) and the second PC (Y-axis).
+We see there is much overlap between the two groups, but the second PC might be interesting with regards to the rejection status, as more red dots can be seen in the upper area of the plot and more blue dots in the lower area.
+
+
+### Asses loadings 
+
+
+Because a biplot in this setting will not be interpretable, we only assess the loadings of the first two PC's, for each gene. These loadings represent the contribution of each gene to the PC.
+
+```{r}
+par(mfrow = c(1, 2))
+
+hist(Vk[, 1], breaks = 50, xlab = "PC 1 loadings", main = "")
+abline(v = c(
+  quantile(Vk[, 1], 0.05),
+  quantile(Vk[, 1], 0.95)), col = "red", lwd = 2)
+
+
+hist(Vk[, 2], breaks = 50, xlab = "PC 2 loadings", main = "")
+abline(v = c(
+  quantile(Vk[, 2], 0.05),
+  quantile(Vk[, 2], 0.95)
+), col = "red", lwd = 2)
+```
+
+Many genes contribute to the first PC's, the vast majority (95%) of these genes are within the two vertical red lines. We can see no distinct outliers, no genes in particular are really driving these PC's. The loadings of the first PC are skewed to the right, the do not follow a normal distribution. There a very few negative loadings compared to positive, meaning most genes will positively influence the first PC when their gene expression is upregulated.
+
+
+
+## LDA
+
+A better way to visualize a potential difference between the two rejection statusses is with Fisher's Linear Discriminant Analysis.
+We will look for a direction $a$ in the 13699-dimensional space, so that the orthogonal projections of the predictors ($X^Ta$) show a maximized ratio between the SSB (between sum of squares) and the SSE (within sum of squares).
+
+$$
+V = ArgMax_a\frac{a^TBa}{a^TWa}
+$$
+
+$B$ is the between covariance matrix of X, $W$ is the within covariance matrix of X, and $a^TWa = 1$ in order to have a unique solution
+
+
+```{r cache = TRUE}
+kid_lda <- lda(x = X, grouping = reject_status)
+```
+
+
+```{r}
+cols <- c("n" = "red", "t" = "blue")
+Vlda <- kid_lda$scaling
+Zlda <- X %*% Vlda
+par(mfrow = c(1, 1))
+boxplot(Zlda ~ reject_status, col = cols, ylab = expression("Z"[1]), 
+        main = "Separation of non rejected and rejected kidneys by LDA")
+```
+
+With LDA we see a clear distinction between the two groups, with a little overlap.
+
+This shows that we might assume that there is a difference in gene expression between patients who show no rejection of the kidney compared to those whose transplanted kidney is rejected.
+
+
+
+# Hypothesis testing
+
+We will test the following hypothesis
+
+$H_{0i}: \mu_{NRi} = \mu_{Ri}$
+
+against the alternative
+
+$H_{1i}: \mu_{NRi} \neq \mu_{Ri}$
+
+for all 13669 genes. 
+
+This will cause a big multiple testing problem, which we will then correct using the Benjamini and Hochberg method with the False Discover Rate (FDR) set at 10%.
+
+## Two-sided two-sample t-test
+
+A two-sided two-sample t-test is executed for all 13669 genes. We have unequal sample sizes $n_0$ and $n_1$ but assume equal variance.
+
+$t=\frac{\overline{X_0}-\overline{X_1}}{S\sqrt{\frac{1}{n_0}+\frac{1}{n_1}}}$
+
+with $n_0=174$ and $n_1 = 76$
+
+
+```{r}
+ttest_results <- t(apply(X, 2, function(x) {
+  t_test <- t.test(x ~ reject_status)
+  p_val <- t_test$p.value
+  stat <- t_test$statistic
+  df <- t_test$parameter
+  ## Return values in named vector
+  c(stat, "p_val" = p_val, df)
+}))
+
+head(ttest_results)
+```
+
+```{r}
+p_vals <- ttest_results[, "p_val"]
+hist(
+  p_vals,
+  breaks = seq(0, 1, by = 0.05), main = "", xlab = "p-value",
+  ylim = c(0, 5000)
+)
+
+```
+
+This plot shows us that a large proportion of p-values falls under the significance threshold of 0.05. 
+
+```{r}
+alpha <- 0.05
+sum(p_vals < alpha)
+```
+
+This gives us 4012 significant results. Because we perform 13669 simultaneous t-tests at a 0.05 significance level, 0.05 x 13699 = 684.95 results would come up positive if all nullhypotheses were true, meaning we expect 685 false positives to occur if we don't correct for multiple testing.
+
+## BH95
+
+The next step is to correct the multiple testing problem with an FDR set at 10%, using the Benjamini and Hochberg (1995) method. An FDR of 10% means we will tolerate on average 10% false postives among all the positive outcomes:
+
+$FDR = E[\frac{FP}{R}] = E[FDP]$
+
+The BH95 method consists of calculating adjusted p-values, which we then test against our FDR controlled at $\alpha = 0,1$:
+
+$q_{(i)}=min[min_{j=i, ...,m}(\frac{mp_{(j)}}{j}), 1]$
+
+
+
+```{r}
+fdr <- p.adjust(p_vals, method = "BH")
+
+plot(
+  p_vals[order(p_vals)], fdr[order(p_vals)],
+  pch = 19, cex = 0.6, xlab = "p-value", ylab = "FDR-adjusted p-value", col = 4
+)
+abline(a = 0, b = 1)
+```
+
+```{r}
+sum(fdr < 0.10)
+```
+
+When the FDR is controlled at 10%, we still find 3106 significant discoveries. 
+We have to take into account that we are testing a subset of 25% of the most variable genes from the original data set. This explains why such a large proportion of genes comes back as possibly having differential expressions.
+
+We can further explore the distribution of these adjusted p-values.
+
+```{r}
+fdr_df <- as.data.frame(fdr)
+fdr_df$ID <- rownames(fdr_df)
+
+sign_genes <- fdr_df %>%
+  filter(fdr_df$fdr < 0.10)
+ord_genes <- sign_genes[order(sign_genes$fdr),, drop = FALSE]
+
+head(ord_genes, 10)
+```
+We created a list with the significant p-values sorted from small to large (here we only show 10 genes with the lowest p-values).
+
+```{r}
+ord_genes$logp <- log(ord_genes$fdr)
+hist(ord_genes$logp,
+     breaks = 50,
+     ylim = c(0, 800),
+     xlim = c(-40, 5),
+     main = "Histogram of the logtransformed significant adjusted p-values")
+```
+
+In order to see how these p-values are distributed, we logtransformed them and plotted these values on a histogram. This shows us that there are some very small adjusted p-values. The genes corresponding to these p-values might be interesting to look at. 
+
+```{r}
+under10 <- ord_genes %>%
+  filter(ord_genes$logp < -10)
+nrow(under10)
+
+under30 <- ord_genes %>%
+  filter(ord_genes$logp < -30)
+nrow(under30)
+```
+
+
+## Local fdr
+
+Another way to explore potential differential expression is by using the local fdr method. This gives us the probability that a gene is a null (gene for which $H_{0i}$ is true, i.e. no differential expression) given a certain gene: $fdr(z) =P[null|z]$. 
+
+If the local fdr is sufficiently small for a given gene, it will be very probable that this gene will be a true positive.
+
+For this method we need to transform the t-statistics into z-scores. 
+
+```{r}
+t <- ttest_results[, "t"]
+length(t)
+
+z1 <- rep(NA, length(t))
+for(i in 0:length(t)){
+  z1[i] <- qnorm(pt(t[i], df= 248))
+}
+mean(z1)  
+sd(z1)
+
+```
+
+
+```{r}
+lfdr <- locfdr(z1, plot = 2)
+```
+
+This graph shows us that we can expect non-nulls for extreme negative z-values, and (almost) none for positive z-values.
+
+The expected false discovery rate  $Efdr = E_{f1}[fdr(z)]$  is the expected probability of falsely finding a null als a significant result and is a measure for the power of the tests. We want this to be as small as possible.
+Here the Efdr is 0.235, we have a 23.5% chance of falsely claiming a significant result. 
+
+
+```{r}
+lfdr1 <- lfdr$fdr
+gene_ID <- colnames(X)
+lfdr_df <- as.data.frame(cbind(gene_ID, lfdr1))
+lfdr_df$lfdr1 <- as.numeric((lfdr_df$lfdr1))
+sig <- lfdr_df[fdr_df$ID %in% sign_genes$ID,]
+hist(sig$lfdr1)
+```
+
+When we now only look at the genes that were returned significant with FDR = 10%, we see that a large proportion of these genes score poorly on a local fdr basis (many are around 100% local fdr), but we also see many genes under 10% local fdr.
+
+We could filter additionally with local fdr set at 10% 
+
+```{r}
+Sig_sig <- sig %>%
+  filter(sig$lfdr1 < 0.10)
+nrow(Sig_sig)
+most_sig_p <- sign_genes[sign_genes$ID %in% Sig_sig$gene_ID,]
+most_sig_p$lfdr <- Sig_sig$lfdr1
+colnames(most_sig_p) <- c("adj_p", "ID", "lfdr")
+rownames(most_sig_p) <- NULL
+head(most_sig_p)
+```
+
+This gives us 522 genes that have at the most a probability of 10% of being a null (no differential expression). The fill list can be seen in the appendix.
+
+
+
+
+
+# Prediction 
+
+For the third research question we will see if we can find a prediction model that can predict kidney rejection status from gene expression. The problem we encounter when dealing with high dimensional data ($p>n$) is that we have too many variables, which will cause the model to be grossly overfitted and useless for prediction purposes.
+
+
+3 methods can be used to circumvent this problem:
+
+- Principal Component Regression (PCR)
+
+- Penalized Regression: Ridge 
+
+- Penalized Regression: Lasso
+
+Before we begin applying these methods we divide the original data set in training data and test data. This way the training data is used for building the model, while we keep the test data to evaluate our final model.
+
+```{r}
+set.seed(2021)
+####
+Y <- kidney_data$Reject_Status
+n <- nrow(X)
+nTrain <- round(0.7*n)
+indTrain <- sample(1:n,nTrain)
+XTrain <- X[indTrain,]
+YTrain <- Y[indTrain]
+XTest <- X[-indTrain,]
+YTest <- Y[-indTrain]
+table(YTest)
+table(YTrain)
+table(Y)
+23/(52+23) 
+53/(122+53)
+76/250
+
+```
+
+Our randomly chosen test data set has 30.6% rejection cases on a total of 75 cases, training data 30.3% on 175 cases and our original data had 30.4%. This means the same ratio is roughly preserved.
+
+
+## PCR 
+
+(PCR code is set to eval = FALSE because it was compiled separately and is not compatible with the rest of the code and impossible to adapt it in time. The output can be found in the appendix)
+
+We will reduce our original matrix of predictors $X$ of $p$ dimensions to a new matrix $Z$ of $n$ dimensions. From this new matrix we will only select those PC's that contribute the most with regards to our research question. These are not necessarily the first PC's.
+
+
+
+```{r eval=FALSE, include=TRUE}
+
+## Calculate PCA and extract scores
+pca_X <- prcomp(XTrain)
+pca_var <- pca_X$sdev^2
+pca_var_per <- round(pca_var/sum(pca_var)*100, 1)
+barplot(pca_var)
+Z <- pca_X$x
+
+## Total number of available PCs
+n_PC <- ncol(Z)
+
+## cv.glm() requires the response and predictors in one data.frame, so we need
+## to combine them back together
+fit_data <- data.frame(YTrain, Z)
+head(fit_data)
+
+## Example of PC Log. Reg. with all PCs
+full_model <- glm(YTrain ~ ., data = fit_data, family = "binomial")
+# summary(full_model)
+```
+
+### Cross-validation
+
+In order evaluate our model building process by estimating the Expected Test Error: $E_\tau[Err_\tau]=E_{Y^*, X^*, \tau}[(\hat{m}(X^*)-Y^*)^2]$.  We want this expected test error to be as small as possible.
+
+The ETE is estimated using a 4 fold cross-validation method: $CV_k = \frac{1}{k}\sum_{j=1}^k\frac{1}{n_j}\sum_{i\epsilon S_j)}(Y_i-\hat{m}^{-S_j}(x_i))^2$ with $k=4$
+
+This method will be used to select our principal components (and later to estimate the optimal $\lambda$ for the ridge and lasso penalized regression).
+
+```{r eval=FALSE, include=TRUE}
+## 4-fold Cross-validation on this one particular model, using AUC and K = 4
+full_model_cv <- cv.glm(
+  data = fit_data,  glmfit = full_model,
+  cost = pROC::auc, K = 4  # note: specify the auc function (from pROC) without`()`!
+)
+
+## We'll just use the raw one here
+full_model_cv$delta[1] # This is the AUC for this particular model estimated by AUC
+
+## wrap this code in a for-loop and repeat for each number of PCs
+cv_auc <- rep(NA, n_PC)
+set.seed(12) # seed for reproducibility
+for (i in seq_len(n_PC)) {
+  ## Prepare fit_data; subset number of PCs to i
+  fit_data <- data.frame(YTrain, Z[, 1:i, drop = FALSE])  # use drop = FALSE to avoid problems when subsetting single column
+  pcr_mod <- suppressWarnings(
+    glm(y ~ ., data = fit_data, family = "binomial")
+  )
+  
+ ## Do 4-fold CV while suppressing Warnings and Messages 
+  cv <- suppressWarnings(
+    suppressMessages(
+      cv.glm(fit_data, pcr_mod, cost = pROC::auc, K = 4)
+    )
+  )
+  cv_auc[i] <- cv$delta[1]
+}
+names(cv_auc) <- seq_along(cv_auc)
+cv_auc
+## Finding the optimal nr. of PCs corresponds to finding the max. AUC
+optim_nPC <- names(which.max(cv_auc))
+optim_nPC
+
+plot(names(cv_auc), cv_auc, xlab = "n PCs", ylab = "AUC", type = "l")
+abline(v = optim_nPC, col = "red")
+```
+
+
+### Model evaluation
+
+We evaluate the model by calculating the Area Under the Curve (AUC), specifically for the Receiver Operating Characteristic (ROC) curve. 
+This curve maps the threshold c, which is the critical value which separates the negative outcomes from the positive and which decides the sensitivity (P(true positive)) and the specificity (P(ctrue negative)) of a test. This c is plotted against the sensitivity on the y-axis and 1-specificity (P(false positive)) on the x-axis. The larger the area under this curve means, the better the prediction value of a model (a perfect test which has no false positive or false negative outcomes has a AUC of 1). 
+
+```{r eval=FALSE, include=TRUE}
+## prediction using Test data
+pca_X <- prcomp(XTrain)
+# YTrain <- as.factor(YTrain)
+# dim(Xtrain)
+Z <- pca_X$x
+dim(Z)
+pca_var <- pca_X$sdev^2
+pca_var_per <- round(pca_var/sum(pca_var)*100, 1)
+barplot(pca_var)
+
+opt_data <- data.frame(YTrain, Z[, 1:13])
+head(opt_data)
+table(YTrain)
+summary(YTrain)
+
+opt_model <- glm(YTrain ~ ., data = opt_data, family = "binomial")
+summary(opt_model)
+#The estimators of coefficients that have been obtained (βZ), as stated in the introduction can be multiplied by matrix V to obtain βX.
+beta.Z <- as.matrix(opt_model$coefficients[2:14])
+V <- as.matrix(pca_X$rotation[,2:14])
+
+# In order to compare the prediction, I am predicting the values based on the βX coefficient estimates calculated before, according to this equation
+# βX = V X βZ
+beta.X <- V %*% beta.Z
+head(beta.X)
+
+pred.test <- as.matrix(XTest)
+# head(pred.test)
+# head(beta.X)
+y.pred.test2 <- pred.test %*% beta.X
+
+plot(y.pred.test2)
+
+logit2prob <- function(logit){
+  odds <- exp(logit)
+  prob <- odds / (1 + odds)
+  return(prob)
+}
+
+prob <- logit2prob(y.pred.test2)
+XTest$predict <- ifelse(prob > 0.50, "1", "0")
+table(YTest)
+
+confusion_mat <- table(YTest, XTest$predict)
+rownames(confusion_mat) <- c("obs.0", "obs.1")
+colnames(confusion_mat) <- c("pred.0", "pred.1")
+confusion_mat
+dim(data.frame(prob))
+
+pred <- prediction(prob, YTest)
+
+perf <- performance(pred, measure = "tpr", x.measure = "fpr")
+plot(perf)
+auc <- performance(pred, measure = "auc")
+auc <- auc@y.values[[1]]
+paste("AUC:", auc)
+```
+
+
+
+## Ridge
+
+The penalized Ridge regression method consists of adding a penalty term to the usual sum of least squares solution:
+
+$SSE_{pen}=||Y-X\beta||^2 + \lambda||\beta||_2^2$
+
+where $||\beta||_2^2 = \sum_{j=1}^p\beta_j^2$ is the $L_2$ penalty term and $\lambda >0$ is the penalty parameter.
+
+
+
+```{r}
+ridge <- glmnet(
+  x = XTrain,
+  y = YTrain,
+  alpha = 0,         # ridge: alpha = 0
+  family="binomial")  
+
+plot(ridge, xvar = "lambda")
+```
+
+```{r}
+cv_ridge <- cv.glmnet(
+  x = XTrain,
+  y = YTrain,
+  alpha = 0,               # ridge: alpha = 0
+  type.measure = "class",
+    family = "binomial")  
+
+plot(cv_ridge)
+```
+
+
+### Model Evaluation
+
+We now look at the ROC curve for a model using the optimal penalty parameter $\lambda$ 
+
+```{r}
+
+dfRidgeOpt <- data.frame(
+  pi = predict(cv_ridge,
+    newx = XTest,
+    s = cv_ridge$lambda.min,
+    type = "response") %>% c(.),
+  known.truth = YTest)
+
+
+rocridge <-
+  dfRidgeOpt  %>%
+  ggplot(aes(d = known.truth, m = pi)) +
+  geom_roc(n.cuts = 0) +
+  xlab("1-specificity (FPR)") +
+  ylab("sensitivity (TPR)")
+
+rocridge
+```
+
+```{r}
+calc_auc(rocridge)
+```
+
+
+## Lasso
+
+The penalize Lasso regression, like the Ridge regression, uses a penalty term, but a different one:
+
+$SSE_{pen}=||Y-X\beta||^2_2 + \lambda||\beta||_1$
+
+with $||\beta||_1= \sum_{j=1}^p|\beta|$
+
+The difference with the Ridge method is that instead of shrinking the $\beta$'s towards zero, they will be set to zero, resulting in less parameters in the model.
+
+```{r}
+lasso <- glmnet(
+  x = XTrain,
+  y = YTrain,
+  alpha = 1,         # lasso: alpha = 1
+  family="binomial")  
+
+plot(lasso, xvar = "lambda", xlim = c(-6,-1.5))
+```
+
+```{r}
+cv_lasso <- cv.glmnet(
+  x = XTrain,
+  y = YTrain,
+  alpha = 1,               # lasso: alpha = 1
+  type.measure = "class",
+    family = "binomial")  
+
+plot(cv_lasso)
+```
+
+
+
+### Model evaluation
+
+We now look at the ROC curve for a model using the optimal number of parameters and optimal penalty parameter $\lambda$ 
+
+```{r}
+cv_lasso$lambda.min
+dfLassoOpt <- data.frame(
+  pi = predict(cv_lasso,
+    newx = XTest,
+    s = cv_lasso$lambda.min,
+    type = "response") %>% c(.),
+  known.truth = YTest)
+
+
+roclasso <-
+  dfLassoOpt  %>%
+  ggplot(aes(d = known.truth, m = pi)) +
+  geom_roc(n.cuts = 0) +
+  xlab("1-specificity (FPR)") +
+  ylab("sensitivity (TPR)") +
+  scale_x_continuous(breaks = seq(0,1,0.05))+
+  scale_y_continuous(breaks = seq(0,1,0.05))
+
+roclasso
+
+```
+
+
+```{r}
+calc_auc(roclasso)
+```
+
+## Optimal Model
+
+We choose to continue with the Lasso model, as this model gives us a AUC of 0.85 (with an optimal $\lambda$ of 0.098 and 21 parameters) compared to Ridge where the AUC is a little less 0.83 (despite using all 13669 parameters). For PCR we had a high AUC, but as we tried to evaluate the model using the test data, it gave very bad results. This was probably because instead of manually selecting our PC's, we had taken the first PC's, taking the number that gave us the optimal AUC, not taking into account that these first PC's do not necessarily carry the most information.
+
+## Choosing optimal threshold c for Lasso model
+
+We find the optimal c at a sensitivity rate of 0.77 and a 1-specificity of 0.19. This means we have an 85% chance of correctly calling a true positive, a 19% chance of a false positive and, consequently a 81% chance of correctly calling a negative. As we prefer being sure of our discoveries, and not waste time on false positives, we would like this to be rather low. Another option would be sensitivity of 85%, but then we have 27% chance on false positives, which would be rather high.
+
+
+
+# Conclusion
+
+We can assume with some confidence that there is a relation between rejection status and the gene expression of some genes. This could already be visualized with the LDA technique, and was also confirmed with hypothesis testing. We were able to produce a list of significant genes, with an FDR controlled at 10%, and additionally filtered this list with the use of local fdr. This gave us 522 highly significant genes which could be looked at further with relation to rejection status of transplanted kidneys. Additionally,  we were able to produce a pretty good prediction model from this data set using the Lasso method, with a sensitivity of 80% and a specificity of 96%.
+
+
+# Appendix
+
+## List of 522 most significant genes
+
+```{r}
+most_sig_p
+```
+
+## PCR
+
+
+```{r}
+## Separate response and predictor variables
+y <- factor(kidney_data$Reject_Status)
+X <- X <- kidney_data %>% 
+  dplyr::select(-Patient_ID, -Reject_Status) %>% 
+  as.matrix()
+dim(X)
+
+## Calculate PCA and extract scores
+pca_X <- prcomp(X)
+pca_var <- pca_X$sdev^2
+pca_var_per <- round(pca_var/sum(pca_var)*100, 1)
+barplot(pca_var)
+Z <- pca_X$x
+
+## Total number of available PCs
+n_PC <- ncol(Z)
+
+## cv.glm() requires the response and predictors in one data.frame, so we need
+## to combine them back together
+fit_data <- data.frame(y, Z)
+#head(fit_data)
+
+## Example of PC Log. Reg. with all PCs
+full_model <- glm(y ~ ., data = fit_data, family = "binomial")
+# summary(full_model)
+
+## 4-fold Cross-validation on this one particular model, using AUC and K = 4
+full_model_cv <- cv.glm(
+  data = fit_data,  glmfit = full_model,
+  cost = pROC::auc, K = 4  # note: specify the auc function (from pROC) without`()`!
+)
+
+## We'll just use the raw one here
+full_model_cv$delta[1] # This is the AUC for this particular model estimated by AUC
+
+## wrap this code in a for-loop and repeat for each number of PCs
+cv_auc <- rep(NA, n_PC)
+set.seed(12) # seed for reproducibility
+for (i in seq_len(n_PC)) {
+  ## Prepare fit_data; subset number of PCs to i
+  fit_data <- data.frame(y, Z[, 1:i, drop = FALSE])  # use drop = FALSE to avoid problems when subsetting single column
+  pcr_mod <- suppressWarnings(
+    glm(y ~ ., data = fit_data, family = "binomial")
+  )
+  
+ ## Do 4-fold CV while suppressing Warnings and Messages 
+  cv <- suppressWarnings(
+    suppressMessages(
+      cv.glm(fit_data, pcr_mod, cost = pROC::auc, K = 4)
+    )
+  )
+  cv_auc[i] <- cv$delta[1]
+}
+names(cv_auc) <- seq_along(cv_auc)
+#cv_auc
+## Finding the optimal nr. of PCs corresponds to finding the max. AUC
+optim_nPC <- names(which.max(cv_auc))
+optim_nPC
+
+plot(names(cv_auc), cv_auc, xlab = "n PCs", ylab = "AUC", type = "l")
+abline(v = optim_nPC, col = "red")
+```
+
+### PCR prediction using Test data
+
+```{r}
+## prediction using Test data
+pca_X <- prcomp(XTrain)
+# YTrain <- as.factor(YTrain)
+# dim(Xtrain)
+Z <- pca_X$x
+dim(Z)
+pca_var <- pca_X$sdev^2
+pca_var_per <- round(pca_var/sum(pca_var)*100, 1)
+barplot(pca_var)
+
+opt_data <- data.frame(YTrain, Z[, 1:13])
+head(opt_data)
+table(YTrain)
+summary(YTrain)
+
+opt_model <- glm(YTrain ~ ., data = opt_data, family = "binomial")
+summary(opt_model)
+#The estimators of coefficients that have been obtained (βZ), as stated in the introduction can be multiplied by matrix V to obtain βX.
+beta.Z <- as.matrix(opt_model$coefficients[2:14])
+V <- as.matrix(pca_X$rotation[,2:14])
+
+# In order to compare the prediction, I am predicting the values based on the βX coefficient estimates calculated before, according to this equation
+# βX = V X βZ
+beta.X <- V %*% beta.Z
+#head(beta.X)
+pred.test <- XTest
+#str(pred.test)
+#str(beta.X)
+y.pred.test2 <- pred.test %*% beta.X
+
+plot(y.pred.test2)
+
+logit2prob <- function(logit){
+  odds <- exp(logit)
+  prob <- odds / (1 + odds)
+  return(prob)
+}
+
+prob <- logit2prob(y.pred.test2)
+XTest$predict <- ifelse(prob > 0.50, "1", "0")
+table(YTest)
+
+confusion_mat <- table(YTest, XTest$predict)
+rownames(confusion_mat) <- c("obs.0", "obs.1")
+colnames(confusion_mat) <- c("pred.0", "pred.1")
+confusion_mat
+dim(data.frame(prob))
+
+pred <- prediction(prob, YTest)
+
+perf <- performance(pred, measure = "tpr", x.measure = "fpr")
+plot(perf)
+auc <- performance(pred, measure = "auc")
+auc <- auc@y.values[[1]]
+paste("AUC:", auc)
+```
+
+
+
+
+
+
+
+
+
+
+
