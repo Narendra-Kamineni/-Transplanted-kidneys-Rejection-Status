@@ -1,6 +1,6 @@
 ---
 title: "Project Analysis of High Dimensional Data"
-author: "Bhanu Durganath Angam, Birgit Deboutte, Narendra Kamineni"
+author: "Narendra Kamineni"
 date: "`r Sys.Date()`"
 output:
   html_document:
